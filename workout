@@ -1,0 +1,245 @@
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import { base44 } from "@/api/base44Client";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { getDayData } from "@/lib/workoutData";
+import Timer from "@/components/workout/Timer";
+import ExerciseInfo from "@/components/workout/ExerciseInfo";
+import RestOverlay from "@/components/workout/RestOverlay";
+import WorkoutComplete from "@/components/workout/WorkoutComplete";
+import { Button } from "@/components/ui/button";
+import { ArrowLeft, X } from "lucide-react";
+import { Link } from "react-router-dom";
+import { motion, AnimatePresence } from "framer-motion";
+
+const PHASE = { READY: "ready", EXERCISE: "exercise", REST: "rest", DONE: "done" };
+
+export default function Workout() {
+  const urlParams = new URLSearchParams(window.location.search);
+  const dayNum = parseInt(urlParams.get("day") || "1");
+  const difficulty = urlParams.get("difficulty") || "medium";
+  const duration = parseInt(urlParams.get("duration") || "30");
+  const dayData = getDayData(dayNum, difficulty, duration);
+  const queryClient = useQueryClient();
+  const startTimeRef = useRef(Date.now());
+
+  const [exerciseIndex, setExerciseIndex] = useState(0);
+  const [setIndex, setSetIndex] = useState(0);
+  const [phase, setPhase] = useState(PHASE.READY);
+
+  const currentExercise = dayData?.exercises[exerciseIndex];
+  const totalSets = currentExercise?.sets || 1;
+  const timerKey = `${exerciseIndex}-${setIndex}-${phase}`;
+
+  const saveMutation = useMutation({
+    mutationFn: (data) => base44.entities.WorkoutProgress.create(data),
+    onMutate: async (newRecord) => {
+      await queryClient.cancelQueries({ queryKey: ["workout-progress"] });
+      const prev = queryClient.getQueryData(["workout-progress"]);
+      queryClient.setQueryData(["workout-progress"], (old = []) => [
+        ...old,
+        { ...newRecord, id: `optimistic-${Date.now()}` },
+      ]);
+      return { prev };
+    },
+    onError: (_err, _vars, ctx) => {
+      if (ctx?.prev) queryClient.setQueryData(["workout-progress"], ctx.prev);
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["workout-progress"] }),
+  });
+
+  const getNextExerciseInfo = useCallback(() => {
+    if (setIndex + 1 < totalSets) return currentExercise;
+    if (exerciseIndex + 1 < dayData.exercises.length) return dayData.exercises[exerciseIndex + 1];
+    return null;
+  }, [setIndex, totalSets, exerciseIndex, dayData, currentExercise]);
+
+  const advanceWorkout = useCallback(() => {
+    if (setIndex + 1 < totalSets) {
+      // More sets of current exercise
+      setSetIndex((prev) => prev + 1);
+      setPhase(PHASE.REST);
+    } else if (exerciseIndex + 1 < dayData.exercises.length) {
+      // Next exercise
+      setExerciseIndex((prev) => prev + 1);
+      setSetIndex(0);
+      setPhase(PHASE.REST);
+    } else {
+      // Workout complete
+      const duration = Math.floor((Date.now() - startTimeRef.current) / 1000);
+      saveMutation.mutate({
+        day: dayNum,
+        completed: true,
+        completed_date: new Date().toISOString().split("T")[0],
+        duration_seconds: Math.floor((Date.now() - startTimeRef.current) / 1000),
+      });
+      setPhase(PHASE.DONE);
+    }
+  }, [setIndex, totalSets, exerciseIndex, dayData, dayNum, saveMutation]);
+
+  const handleTimerComplete = useCallback(() => {
+    if (phase === PHASE.EXERCISE) {
+      advanceWorkout();
+    } else if (phase === PHASE.REST) {
+      setPhase(PHASE.EXERCISE);
+    }
+  }, [phase, advanceWorkout]);
+
+  const handleSkip = useCallback(() => {
+    handleTimerComplete();
+  }, [handleTimerComplete]);
+
+  if (!dayData) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <p className="text-muted-foreground">Day not found</p>
+      </div>
+    );
+  }
+
+  if (dayData.isRestDay) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center gap-6 p-6 text-center">
+        <p className="text-6xl font-extrabold tracking-tighter">REST DAY</p>
+        <p className="text-muted-foreground max-w-sm">Let your muscles rebuild. Hydrate, stretch gently, and come back stronger tomorrow.</p>
+        <Link to="/">
+          <Button variant="outline" className="mt-4">Back to Home</Button>
+        </Link>
+      </div>
+    );
+  }
+
+  if (phase === PHASE.DONE) {
+    const duration = Math.floor((Date.now() - startTimeRef.current) / 1000);
+    return <WorkoutComplete day={dayNum} duration={duration} />;
+  }
+
+  const isRest = phase === PHASE.REST;
+  const exerciseDuration = currentExercise?.holdSeconds || 30;
+  const restDuration = currentExercise?.restAfter || 15;
+
+  return (
+    <div
+      className={`min-h-screen flex flex-col transition-colors duration-700 ${
+        isRest ? "bg-primary" : "bg-background"
+      }`}
+    >
+      {/* Top bar */}
+      <div className="flex items-center justify-between px-6 py-4">
+        <Link to="/">
+          <Button
+            variant="ghost"
+            size="icon"
+            className={`w-12 h-12 rounded-full ${isRest ? "text-primary-foreground hover:bg-primary-foreground/10" : ""}`}
+          >
+            <ArrowLeft className="w-5 h-5" />
+          </Button>
+        </Link>
+        <span className={`font-mono text-xs tracking-[0.3em] uppercase ${isRest ? "text-primary-foreground/60" : "text-muted-foreground"}`}>
+          DAY {String(dayNum).padStart(2, "0")} · {exerciseIndex + 1}/{dayData.exercises.length}
+        </span>
+        <Link to="/">
+          <Button
+            variant="ghost"
+            size="icon"
+            className={`w-12 h-12 rounded-full ${isRest ? "text-primary-foreground hover:bg-primary-foreground/10" : ""}`}
+          >
+            <X className="w-5 h-5" />
+          </Button>
+        </Link>
+      </div>
+
+      {/* Main content */}
+      <div className="flex-1 flex flex-col items-center justify-center px-6 py-8 gap-8">
+        <AnimatePresence mode="wait">
+          {phase === PHASE.READY && (
+            <motion.div
+              key="ready"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="text-center space-y-8"
+            >
+              <div>
+                <p className="font-mono text-xs tracking-[0.4em] text-muted-foreground mb-4">GET READY</p>
+                <h2 className="text-3xl md:text-4xl font-extrabold uppercase tracking-wide">
+                  {currentExercise.name}
+                </h2>
+                <p className="text-muted-foreground mt-3 max-w-md mx-auto">
+                  {currentExercise.instruction}
+                </p>
+              </div>
+              <Button
+                size="lg"
+                className="h-16 px-12 rounded-full text-base font-bold tracking-wide"
+                onClick={() => setPhase(PHASE.EXERCISE)}
+              >
+                BEGIN
+              </Button>
+            </motion.div>
+          )}
+
+          {phase === PHASE.EXERCISE && (
+            <motion.div
+              key={`exercise-${timerKey}`}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="w-full flex flex-col items-center gap-8"
+            >
+              {/* Breathing pulse background */}
+              <div className="fixed inset-0 bg-primary/5 animate-pulse-bg pointer-events-none" />
+
+              <Timer
+                key={timerKey}
+                duration={exerciseDuration}
+                onComplete={handleTimerComplete}
+                onSkip={handleSkip}
+                label={currentExercise.holdSeconds ? "Hold" : "Go!"}
+                isRest={false}
+              />
+              <ExerciseInfo
+                exercise={currentExercise}
+                currentSet={setIndex + 1}
+                totalSets={totalSets}
+              />
+            </motion.div>
+          )}
+
+          {phase === PHASE.REST && (
+            <motion.div
+              key={`rest-${timerKey}`}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="w-full flex flex-col items-center gap-8"
+            >
+              <Timer
+                key={timerKey}
+                duration={restDuration}
+                onComplete={handleTimerComplete}
+                onSkip={handleSkip}
+                label="Rest"
+                isRest={true}
+              />
+              <RestOverlay nextExercise={getNextExerciseInfo()} />
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      {/* Bottom progress bar */}
+      <div className="px-6 pb-6">
+        <div className={`h-1 rounded-full overflow-hidden ${isRest ? "bg-primary-foreground/10" : "bg-secondary"}`}>
+          <motion.div
+            className={`h-full rounded-full ${isRest ? "bg-primary-foreground/40" : "bg-primary"}`}
+            initial={{ width: 0 }}
+            animate={{
+              width: `${((exerciseIndex * totalSets + setIndex) / (dayData.exercises.length * totalSets)) * 100}%`,
+            }}
+            transition={{ duration: 0.5 }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
